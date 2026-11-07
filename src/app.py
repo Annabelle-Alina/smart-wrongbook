@@ -7,27 +7,78 @@ API_URL = "http://127.0.0.1:8000"
 st.set_page_config(page_title="智能错题本", page_icon="📚", layout="wide")
 st.title("📚 智能错题本")
 
+# ================= 顶部数据统计卡片 =================
+try:
+    # 请求所有错题数据
+    res_all = requests.get(f"{API_URL}/api/errors").json()
+    all_errors = res_all.get("data", [])
+    total_count = res_all.get("total", 0)
+    
+    # 请求今日复习数据
+    res_today = requests.get(f"{API_URL}/api/review/today").json()
+    today_count = res_today.get("today_count", 0)
+    
+    # 统计最薄弱的科目（出错最多的）
+    from collections import Counter
+    subjects = [e["subject"] for e in all_errors]
+    if subjects:
+        top_subject = Counter(subjects).most_common(1)[0][0]
+    else:
+        top_subject = "暂无数据"
+        
+    # 渲染成三列卡片
+    m1, m2, m3 = st.columns(3)
+    m1.metric(label="📚 总错题数", value=f"{total_count} 道")
+    m2.metric(label="📅 今日待复习", value=f"{today_count} 道", delta="加油复习" if today_count>0 else "全对")
+    m3.metric(label="🔥 最薄弱科目", value=top_subject)
+    
+    st.divider() # 画一条分割线，把卡片和下面的内容隔开
+except Exception as e:
+    st.error("无法加载统计数据，请确保后端服务正常。")
 # ================= 侧边栏：上传区 =================
 with st.sidebar:
     st.header("📸 录入新错题")
     uploaded_file = st.file_uploader("上传错题图片", type=["jpg", "png", "jpeg"])
-    # 增加了更多科目
-    subject = st.selectbox("选择科目", ["数学", "英语", "物理", "化学", "语文", "生物", "历史", "地理", "政治"])
-    
+    subject = st.selectbox("选择科目", ["🤖 AI 自动识别", "数学", "英语", "物理", "化学", "语文", "生物", "历史", "地理", "政治"])
     if st.button("开始识别并保存", type="primary"):
         if uploaded_file is not None:
             with st.spinner("AI 正在识别中，请稍候..."):
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
                 data = {"subject": subject}
                 try:
+                    # 1. 发送图片进行 OCR 识别
                     response = requests.post(f"{API_URL}/api/ocr", files=files, data=data)
                     if response.status_code == 200:
                         st.success("识别并保存成功！")
+                        
+                        # 2. 识别成功后，立刻调用 AI 相似题接口
+                        new_text = response.json().get("text", "")
+                        payload = {"text": new_text, "subject": subject}
+                        sim_res = requests.post(f"{API_URL}/api/find_similar", json=payload)
+                        
+                        # 3. 保存相似题结果到状态栏，以便页面上方展示
+                        if sim_res.status_code == 200:
+                            sim_data = sim_res.json()
+                            if sim_data.get("found"):
+                                st.session_state['similar_warning'] = sim_data
+                            else:
+                                st.session_state['similar_warning'] = None
+                        
                         st.rerun() # 刷新页面
                 except Exception as e:
                     st.error(f"连接服务器失败: {e}")
         else:
             st.warning("请先上传一张图片哦！")
+
+# ================= 主页面上方：展示相似题警告 =================
+if 'similar_warning' in st.session_state and st.session_state['similar_warning']:
+    sim = st.session_state['similar_warning']
+    st.warning(f"⚠️ **注意！你以前做过类似的题！** (相似度: {sim['similarity']*100:.1f}%)")
+    st.info(f"**历史错题内容：** {sim['similar_question']['text']}")
+    
+    if st.button("我知道了，关闭提示"):
+        st.session_state['similar_warning'] = None
+        st.rerun()
 
 # ================= 主页面：分成两列 =================
 col1, col2 = st.columns(2)
@@ -60,6 +111,9 @@ with col1:
 # 右侧列：所有历史错题
 with col2:
     st.header("📖 全部错题本")
+    # ✨ 新增：导出功能
+    if st.button("📥 一键生成错题集(打印版)"):
+        st.markdown(f'<meta http-equiv="refresh" content="0; url={API_URL}/api/export">', unsafe_allow_html=True)
     try:
         res_all = requests.get(f"{API_URL}/api/errors")
         if res_all.status_code == 200:
