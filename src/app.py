@@ -126,11 +126,28 @@ with col2:
                         st.write(f"**完整内容：** {err['text']}")
                         st.write(f"**录入时间：** {err['created_at']}")
                         st.write(f"**已复习次数：** {err['review_count']} 次")
-                        # 增加删除按钮
-                        if st.button("🗑️ 删除这道错题", key=f"delete_{err['id']}"):
-                            res_del = requests.delete(f"{API_URL}/api/errors/{err['id']}")
-                            if res_del.status_code == 200:
-                                st.toast("已成功删除！")
-                                st.rerun() # 删完立刻刷新页面
+                        
+                        # 1. 表单提问区
+                        with st.form(key=f"doubt_form_{err['id']}"):
+                            user_doubt = st.text_input("复习时有什么疑惑？向 AI 提问：", key=f"doubt_input_{err['id']}")
+                            submit_doubt = st.form_submit_button("发送给 AI")
+                            if submit_doubt and user_doubt:
+                                with st.spinner("AI 正在解答你的疑惑..."):
+                                    res = requests.post(f"{API_URL}/api/ask_ai", json={"error_id": err['id'], "doubt": user_doubt})
+                                    if res.status_code == 200:
+                                        st.session_state[f"ai_reply_{err['id']}"] = res.json().get("ai_reply", "")
+                                        st.rerun()
+
+                    # 2. 展示 AI 回答（注意这里在表单外面，但在 for 循环里面）
+                    if f"ai_reply_{err['id']}" in st.session_state:
+                        st.success("💡 AI 解答：")
+                        st.markdown(f"**{st.session_state[f'ai_reply_{err['id']}']}**")
+
+        # 3. 删除按钮
+        if st.button("🗑️ 删除这道错题", key=f"delete_{err['id']}"):
+            res_del = requests.delete(f"{API_URL}/api/errors/{err['id']}")
+            if res_del.status_code == 200:
+                st.toast("已成功删除！")
+                st.rerun()
     except Exception as e:
         pass # 左侧已经报错了，这里就不重复报了

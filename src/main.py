@@ -18,6 +18,8 @@ from datetime import timedelta
 
 from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse
 
+from openai import OpenAI
+
 app = FastAPI(title="智能错题本 API")
 
 # ================= 智能科目判断工具 =================
@@ -60,17 +62,29 @@ DB_PATH = "error_book.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # 创建错题表
+    # 1. 创建基础表（如果不存在）
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS errors (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        text TEXT NOT NULL,
-        subject TEXT DEFAULT '未分类',
-        created_at TEXT NOT NULL,
-        review_count INTEGER DEFAULT 0,
-        embedding TEXT
-    )
-''')
+        CREATE TABLE IF NOT EXISTS errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            subject TEXT DEFAULT '未分类',
+            created_at TEXT NOT NULL,
+            review_count INTEGER DEFAULT 0,
+            embedding TEXT
+        )
+    ''')
+    
+    # 2. ✨ 核心升级：检查并新增字段（防止破坏旧数据）
+    cursor.execute("PRAGMA table_info(errors)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'answer' not in columns:
+        cursor.execute("ALTER TABLE errors ADD COLUMN answer TEXT DEFAULT ''")
+    if 'doubt' not in columns:
+        cursor.execute("ALTER TABLE errors ADD COLUMN doubt TEXT DEFAULT ''")
+    if 'ai_reply' not in columns:
+        cursor.execute("ALTER TABLE errors ADD COLUMN ai_reply TEXT DEFAULT ''")
+        
     conn.commit()
     conn.close()
 
@@ -312,16 +326,43 @@ def export_errors_html():
         <h1>📚 我的智能错题本</h1>
     """
     
+    # 循环遍历所有错题
     for idx, row in enumerate(rows, 1):
-        err_id, text, sub, created_at, review_count, _ = row
+        err_id = row[0]
+        text = row[1]
+        sub = row[2]
+        created_at = row[3]
+        review_count = row[4]
+        doubt = row[7] if len(row) > 7 else ""
+        ai_reply = row[8] if len(row) > 8 else ""
+
+        # 1. 先输出题目卡片的基础信息
         html_content += f"""
         <div class="error-card">
             <div class="error-header">第 {idx} 题 【{sub}】</div>
-            <div class="error-content">{text}</div>
+            <div class="error-content"><strong>题目：</strong>{text}</div>
+        """
+        
+        # 2. 如果有 AI 答疑，加到题目下面
+        if doubt and ai_reply:
+            html_content += f"""
+            <div style="margin-top: 15px; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; border-radius: 4px;">
+                <div style="color: #856404; font-weight: bold; margin-bottom: 5px;">❓ 我的疑惑：</div>
+                <div style="color: #555;">{doubt}</div>
+            </div>
+            <div style="margin-top: 10px; padding: 10px; background: #d1ecf1; border-left: 4px solid #17a2b8; border-radius: 4px;">
+                <div style="color: #0c5460; font-weight: bold; margin-bottom: 5px;">💡 AI 解答：</div>
+                <div style="color: #333; white-space: pre-wrap;">{ai_reply}</div>
+            </div>
+            """
+            
+        # 3. 结束当前题目卡片
+        html_content += f"""
             <div class="error-meta">录入时间: {created_at} | 已复习: {review_count} 次</div>
         </div>
         """
         
+    # 收尾 HTML
     html_content += """
         <div style="text-align: center; margin-top: 40px; color: #bdc3c7; font-size: 12px;">
             由智能错题本生成 - 按 Ctrl+P 可直接打印为 PDF
@@ -330,6 +371,79 @@ def export_errors_html():
     </html>
     """
     return html_content
+# 初始化千问客户端（替换成你的 API Key）
+qwen_client = OpenAI(
+    api_key=os.getenv("QWEN_API_KEY"),
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+)
+
+class DoubtRequest(BaseModel):
+    error_id: int
+    doubt: str
+
+@app.post("/api/ask_ai")
+def ask_ai(request: DoubtRequest):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT text FROM errors WHERE id = ?", (request.error_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return {"error": "找不到该错题"}
+    
+    question_text = row[0]
+    prompt = f"我有一道错题：{question_text}\n我的疑惑是：{request.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
+    
+    try:
+        # 调用千问模型（推荐使用 qwen-plus，性价比高[citation:3]）
+        completion = qwen_client.chat.completions.create(
+            model="qwen-plus",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8
+        )
+        ai_reply = completion.choices[0].message.content
+    except Exception as e:
+        conn.close()
+        return {"error": f"千问调用失败: {str(e)}"}
+        
+    cursor.execute("UPDATE errors SET doubt = ?, ai_reply = ? WHERE id = ?", (request.doubt, ai_reply, request.error_id))
+    conn.commit()
+    conn.close()
+    
+    return {"status": "success", "ai_reply": ai_reply} 
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+@app.post("/api/qwen-plus")
+def ask_ai(request: DoubtRequest):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT text FROM errors WHERE id = ?", (request.error_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return {"error": "找不到该错题"}
+    
+    question_text = row[0]
+    prompt = f"我有一道错题：{question_text}\n我的疑惑是：{request.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
+    
+    try:
+        # 调用千问模型（推荐使用 qwen-plus，性价比高[citation:3]）
+        completion = qwen_client.chat.completions.create(
+            model="qwen-plus",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.8
+        )
+        ai_reply = completion.choices[0].message.content
+    except Exception as e:
+        conn.close()
+        return {"error": f"千问调用失败: {str(e)}"}
+        
+    cursor.execute("UPDATE errors SET doubt = ?, ai_reply = ? WHERE id = ?", (request.doubt, ai_reply, request.error_id))
+    conn.commit()
+    conn.close()
+    s
+    return {"status": "success", "ai_reply": ai_reply}
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
