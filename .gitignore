@@ -198,3 +198,5 @@ venv/
 uploads/
 *.db
 *.pdf
+# 忽略环境配置文件，防止泄密
+.env

@@ -19,9 +19,37 @@ from datetime import timedelta
 from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse
 
 from openai import OpenAI
+import os
+
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import timedelta
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from dotenv import load_dotenv
+
+from fastapi import Request
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+from pix2text import Pix2Text
+
+# 加载 .env 文件中的环境变量
+load_dotenv()
+# 读取密钥，如果读不到就用一个默认值（防止直接报错）
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "fallback-secret-for-dev-only")
 
 app = FastAPI(title="智能错题本 API")
+# 加载 Pix2Text 模型（放在 app 初始化后面、接口定义前面）
+print("正在加载 Pix2Text 一体化识别模型...")
+p2t = Pix2Text.from_config()
 
+# 初始化限流器
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # ================= 智能科目判断工具 =================
 def detect_subject_by_text(text: str) -> str:
     text_lower = text.lower()
@@ -62,7 +90,6 @@ DB_PATH = "error_book.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # 1. 创建基础表（如果不存在）
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS errors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,28 +97,152 @@ def init_db():
             subject TEXT DEFAULT '未分类',
             created_at TEXT NOT NULL,
             review_count INTEGER DEFAULT 0,
-            embedding TEXT
+            embedding TEXT,
+            answer TEXT DEFAULT '',
+            doubt TEXT DEFAULT '',
+            ai_reply TEXT DEFAULT ''
         )
     ''')
-    
-    # 2. ✨ 核心升级：检查并新增字段（防止破坏旧数据）
-    cursor.execute("PRAGMA table_info(errors)")
-    columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'answer' not in columns:
-        cursor.execute("ALTER TABLE errors ADD COLUMN answer TEXT DEFAULT ''")
-    if 'doubt' not in columns:
-        cursor.execute("ALTER TABLE errors ADD COLUMN doubt TEXT DEFAULT ''")
-    if 'ai_reply' not in columns:
-        cursor.execute("ALTER TABLE errors ADD COLUMN ai_reply TEXT DEFAULT ''")
-        
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL
+        )
+    ''')
+    # ✨ 新增：安全审计与防爆破日志表
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS login_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            attempt_time TEXT NOT NULL,
+            status TEXT NOT NULL
+        )
+    ''')
     conn.commit()
     conn.close()
-
 # 启动时执行建表
 init_db()
 
-# 3. 定义数据模型
+# 3. 安全配置与密码加密工具
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+# 4. 定义数据模型
+# ================= 安全认证接口 =================
+class UserAuth(BaseModel):
+    username: str
+    password: str
+
+def check_brute_force(request: Request):
+    client_ip = request.client.host
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    fifteen_mins_ago = (datetime.now() - timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "SELECT COUNT(*) FROM login_logs WHERE ip_address = ? AND status = 'failed' AND attempt_time > ?", 
+        (client_ip, fifteen_mins_ago)
+    )
+    fail_count = cursor.fetchone()[0]
+    conn.close()
+    if fail_count >= 3:
+        raise HTTPException(
+            status_code=429, 
+            detail="检测到多次错误尝试，您的 IP 已被暂时封禁 15 分钟！"
+        )
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="身份验证失败，请重新登录",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user is None:
+        raise credentials_exception
+    return user[1]
+# 1. 注册接口
+@app.post("/api/register")
+def register(user: UserAuth):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 检查用户名是否已经存在
+    cursor.execute("SELECT id FROM users WHERE username = ?", (user.username,))
+    if cursor.fetchone():
+        conn.close()
+        return {"error": "用户名已存在"}
+        
+    # 密码加盐哈希加密
+    hashed_pwd = get_password_hash(user.password)
+    cursor.execute("INSERT INTO users (username, hashed_password) VALUES (?, ?)", (user.username, hashed_pwd))
+    conn.commit()
+    conn.close()
+    return {"status": "success", "message": "注册成功！"}
+# 1.先定义生成Token的工具函数（顶格写）
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+# 2. 登录接口
+@app.post("/api/login")
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    # 1. 进门先查黑名单
+    check_brute_force(request)
+    client_ip = request.client.host
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT hashed_password FROM users WHERE username = ?", (form_data.username,))
+    user = cursor.fetchone()
+    
+    # 2. 如果用户不存在，或者密码验证失败
+    if not user or not verify_password(form_data.password, user[0]):
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            "INSERT INTO login_logs (ip_address, attempt_time, status) VALUES (?, ?, 'failed')", 
+            (client_ip, now_str)
+        )
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    
+    # 3. 验证成功，记录成功日志
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "INSERT INTO login_logs (ip_address, attempt_time, status) VALUES (?, ?, 'success')", 
+        (client_ip, now_str)
+    )
+    conn.commit()
+    conn.close()
+        
+    # 4. 验证通过，生成 JWT 令牌
+    access_token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+# ================= 以下为独立工具函数，必须完全顶格写 =================
+
 class Question(BaseModel):
     text: str
     subject: str
@@ -119,7 +270,7 @@ def add_question(question: Question):
     return {"status": "success", "message": "错题已保存", "id": new_id}
 # 接口：获取所有错题（可以按科目筛选）
 @app.get("/api/errors")
-def get_all_errors():
+def get_all_errors(current_user: str = Depends(get_current_user)):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # 让结果以字典形式返回
     cursor = conn.cursor()
@@ -170,7 +321,42 @@ def get_today_reviews():
             today_reviews.append(err)
 
     return {"today_count": len(today_reviews), "data": today_reviews}
-
+    # 3. 验证成功，记录成功日志
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute(
+        "INSERT INTO login_logs (ip_address, attempt_time, status) VALUES (?, ?, 'success')", 
+        (client_ip, now_str)
+    )
+    conn.commit()
+    conn.close()
+        
+    # 4. 验证通过，生成 JWT 令牌
+    access_token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+# ================= 门卫函数 =================
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="身份验证失败，请重新登录",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user is None:
+        raise credentials_exception
+    return user[1]
 # 接口：标记复习完成（复习次数+1）
 @app.post("/api/review/{error_id}")
 def mark_reviewed(error_id: int):
@@ -248,6 +434,39 @@ def find_similar(question: Question):
         return {"status": "success", "found": False, "message": "没有找到相似题"}
 
 # ================= 接口：OCR 识别并自动存入数据库 =================
+@app.post("/api/ocr_formula")
+async def extract_formula_from_image(
+    file: UploadFile = File(...),
+    subject: str = "数学",
+    current_user: str = Depends(get_current_user) # 保留门禁
+):
+    # 1. 保存图片
+    file_path = UPLOAD_DIR / file.filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    try:
+        # 2. 调用 Pix2Text 识别（返回的是 Markdown 格式，公式用 $ 包裹）
+        result_markdown = p2t.recognize_text_formula(str(file_path), return_text=True)
+        
+        # 3. 计算向量并存入数据库
+        embedding = st_model.encode(result_markdown).tolist()
+        embedding_str = json.dumps(embedding)
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            "INSERT INTO errors (text, subject, created_at, embedding) VALUES (?, ?, ?, ?)", 
+            (result_markdown, subject, now, embedding_str)
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+        conn.close()
+        
+        return {"status": "success", "id": new_id, "text": result_markdown}
+    except Exception as e:
+        return {"status": "error", "message": f"公式识别失败: {str(e)}"}
 @app.post("/api/ocr")
 async def extract_text_from_image(
     file: UploadFile = File(...),
@@ -294,6 +513,39 @@ async def extract_text_from_image(
         "confidence": round(avg_confidence, 2)
     }
 
+@app.post("/api/ocr_mixed")
+async def ocr_mixed_content(
+    file: UploadFile = File(...),
+    subject: str = "未分类",
+    current_user: str = Depends(get_current_user) # 保留你的安全门禁
+):
+    file_path = UPLOAD_DIR / file.filename
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    try:
+        # 调用 P2T 进行一体化识别（文字+公式+表格）
+        # return_text=True 会直接返回 Markdown 字符串
+        result_markdown = p2t.recognize_text_formula(str(file_path), return_text=True)
+        
+        # 存入数据库（你的 embedding 字段依然可以存这个 Markdown 的向量）
+        embedding = st_model.encode(result_markdown).tolist()
+        embedding_str = json.dumps(embedding)
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            "INSERT INTO errors (text, subject, created_at, embedding) VALUES (?, ?, ?, ?)", 
+            (result_markdown, subject, now, embedding_str)
+        )
+        conn.commit()
+        new_id = cursor.lastrowid
+        conn.close()
+        
+        return {"status": "success", "id": new_id, "text": result_markdown}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 # ================= 接口：一键导出错题集 =================
 @app.get("/api/export", response_class=HTMLResponse)
 def export_errors_html():
@@ -382,17 +634,19 @@ class DoubtRequest(BaseModel):
     doubt: str
 
 @app.post("/api/ask_ai")
-def ask_ai(request: DoubtRequest):
+@limiter.limit("5/minute")  # ✨ 核心：同一个 IP 每分钟最多 5 次
+def ask_ai(request: Request, doubt_req: DoubtRequest): 
+    # 注意：上面的参数名如果你的叫 request 可能会重名，建议把原来的请求体参数改名叫 doubt_req
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT text FROM errors WHERE id = ?", (request.error_id,))
+    cursor.execute("SELECT text FROM errors WHERE id = ?", (doubt_req.error_id,))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return {"error": "找不到该错题"}
     
     question_text = row[0]
-    prompt = f"我有一道错题：{question_text}\n我的疑惑是：{request.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
+    prompt = f"我有一道错题：{question_text}\n我的疑惑是：{doubt_req.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
     
     try:
         # 调用千问模型（推荐使用 qwen-plus，性价比高[citation:3]）
@@ -406,7 +660,7 @@ def ask_ai(request: DoubtRequest):
         conn.close()
         return {"error": f"千问调用失败: {str(e)}"}
         
-    cursor.execute("UPDATE errors SET doubt = ?, ai_reply = ? WHERE id = ?", (request.doubt, ai_reply, request.error_id))
+    cursor.execute("UPDATE errors SET doubt = ?, ai_reply = ? WHERE id = ?", (doubt_req.doubt, ai_reply, doubt_req.error_id))
     conn.commit()
     conn.close()
     
@@ -415,17 +669,17 @@ def ask_ai(request: DoubtRequest):
 
 
 @app.post("/api/qwen-plus")
-def ask_ai(request: DoubtRequest):
+def ask_ai(request: Request, doubt_req: DoubtRequest): 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT text FROM errors WHERE id = ?", (request.error_id,))
+    cursor.execute("SELECT text FROM errors WHERE id = ?", (doubt_req.error_id,))
     row = cursor.fetchone()
     if not row:
         conn.close()
         return {"error": "找不到该错题"}
     
     question_text = row[0]
-    prompt = f"我有一道错题：{question_text}\n我的疑惑是：{request.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
+    prompt = f"我有一道错题：{question_text}\n我的疑惑是：{doubt_req.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
     
     try:
         # 调用千问模型（推荐使用 qwen-plus，性价比高[citation:3]）
