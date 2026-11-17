@@ -20,11 +20,13 @@ from fastapi.responses import PlainTextResponse, HTMLResponse, FileResponse
 
 from openai import OpenAI
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import timedelta
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status,Query
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from dotenv import load_dotenv
 
@@ -36,8 +38,12 @@ from slowapi.errors import RateLimitExceeded
 
 from pix2text import Pix2Text
 
-# 加载 .env 文件中的环境变量
-load_dotenv()
+import urllib.parse
+from urllib.parse import quote
+# 获取项目根目录（src 的上一级）
+BASE_DIR = Path(__file__).resolve().parent.parent
+env_path = BASE_DIR / ".env"
+load_dotenv(dotenv_path=env_path)  # 👈 强制读取这个路径的 .env
 # 读取密钥，如果读不到就用一个默认值（防止直接报错）
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "fallback-secret-for-dev-only")
 
@@ -466,7 +472,12 @@ async def extract_formula_from_image(
         
         return {"status": "success", "id": new_id, "text": result_markdown}
     except Exception as e:
-        return {"status": "error", "message": f"公式识别失败: {str(e)}"}
+        conn.close()
+        # 提取错误信息，如果是429就返回中文
+        error_msg = str(e)
+        if "429" in error_msg:
+            return {"status": "error", "message": "公式识别服务请求过于频繁，请稍后再试。"}
+        return {"status": "error", "message": f"公式识别失败: {error_msg}"}
 @app.post("/api/ocr")
 async def extract_text_from_image(
     file: UploadFile = File(...),
@@ -548,17 +559,31 @@ async def ocr_mixed_content(
         return {"status": "error", "message": str(e)}
 # ================= 接口：一键导出错题集 =================
 @app.get("/api/export", response_class=HTMLResponse)
-def export_errors_html():
+def export_errors_html(excerpts: str = Query("")):
+    # 1. 解析前端传来的摘录
+    decoded_excerpts = urllib.parse.unquote(excerpts)
+
+    excerpt_dict = {}
+    if decoded_excerpts:
+        for item in decoded_excerpts.split("||"):
+            if ":" in item:
+                eid, text = item.split(":", 1)
+                # 👇 强制把 ID 转成字符串（去掉所有空格）
+                excerpt_dict[str(eid).strip()] = text.strip()
+            
+    # 👇 验尸代码：看看黑窗口打印了什么
+    print(f"🔥 收到的字典: {excerpt_dict}")
+    # 2. 查询数据库
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM errors ORDER BY created_at DESC")
     rows = cursor.fetchall()
     conn.close()
-    
+
     if not rows:
         return "<h2>暂无错题可以导出！</h2>"
 
-    # 基础 HTML 模板
+    # 3. 基础 HTML 模板
     html_content = """
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -577,8 +602,8 @@ def export_errors_html():
     <body>
         <h1>📚 我的智能错题本</h1>
     """
-    
-    # 循环遍历所有错题
+
+    # 4. 循环遍历渲染
     for idx, row in enumerate(rows, 1):
         err_id = row[0]
         text = row[1]
@@ -588,33 +613,37 @@ def export_errors_html():
         doubt = row[7] if len(row) > 7 else ""
         ai_reply = row[8] if len(row) > 8 else ""
 
-        # 1. 先输出题目卡片的基础信息
         html_content += f"""
         <div class="error-card">
             <div class="error-header">第 {idx} 题 【{sub}】</div>
             <div class="error-content"><strong>题目：</strong>{text}</div>
         """
-        
-        # 2. 如果有 AI 答疑，加到题目下面
+
         if doubt and ai_reply:
+            # 👇 核心修复：如果字典里有这个ID，就打摘录；没有就打全部
+            if str(err_id) in excerpt_dict:
+                short_reply = excerpt_dict[str(err_id)]
+                print(f"✅ 命中摘录！只打印：{short_reply}")
+            else:
+                short_reply = ai_reply
+                print(f"❌ 没找到摘录，打印全部！当前ID是：{err_id}，字典里只有：{list(excerpt_dict.keys())}")
+
             html_content += f"""
             <div style="margin-top: 15px; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; border-radius: 4px;">
                 <div style="color: #856404; font-weight: bold; margin-bottom: 5px;">❓ 我的疑惑：</div>
                 <div style="color: #555;">{doubt}</div>
             </div>
             <div style="margin-top: 10px; padding: 10px; background: #d1ecf1; border-left: 4px solid #17a2b8; border-radius: 4px;">
-                <div style="color: #0c5460; font-weight: bold; margin-bottom: 5px;">💡 AI 解答：</div>
-                <div style="color: #333; white-space: pre-wrap;">{ai_reply}</div>
+                <div style="color: #0c5460; font-weight: bold; margin-bottom: 5px;">💡 AI 核心解答：</div>
+                <div style="color: #333; white-space: pre-wrap;">{short_reply}</div>
             </div>
             """
-            
-        # 3. 结束当前题目卡片
+
         html_content += f"""
             <div class="error-meta">录入时间: {created_at} | 已复习: {review_count} 次</div>
         </div>
         """
-        
-    # 收尾 HTML
+
     html_content += """
         <div style="text-align: center; margin-top: 40px; color: #bdc3c7; font-size: 12px;">
             由智能错题本生成 - 按 Ctrl+P 可直接打印为 PDF
@@ -622,11 +651,14 @@ def export_errors_html():
     </body>
     </html>
     """
+    
     return html_content
-# 初始化千问客户端（替换成你的 API Key）
-qwen_client = OpenAI(
-    api_key=os.getenv("QWEN_API_KEY"),
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# 初始化智谱客户端
+zhipu_client = OpenAI(
+    api_key=os.getenv("ZHIPU_API_KEY"), # 👈 从环境变量读取
+    base_url="https://open.bigmodel.cn/api/paas/v4", # 智谱的接口
+    timeout=120
 )
 
 class DoubtRequest(BaseModel):
@@ -636,7 +668,6 @@ class DoubtRequest(BaseModel):
 @app.post("/api/ask_ai")
 @limiter.limit("5/minute")  # ✨ 核心：同一个 IP 每分钟最多 5 次
 def ask_ai(request: Request, doubt_req: DoubtRequest): 
-    # 注意：上面的参数名如果你的叫 request 可能会重名，建议把原来的请求体参数改名叫 doubt_req
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT text FROM errors WHERE id = ?", (doubt_req.error_id,))
@@ -646,29 +677,80 @@ def ask_ai(request: Request, doubt_req: DoubtRequest):
         return {"error": "找不到该错题"}
     
     question_text = row[0]
-    prompt = f"我有一道错题：{question_text}\n我的疑惑是：{doubt_req.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
+    # 👇 强制 AI 先输出【修复后的原题】，用特殊符号隔开
+    prompt = f"""我有一道错题：{question_text}
+我的疑惑是：{doubt_req.doubt}
+
+请你严格遵守以下输出格式：
+第一部分：以“【修复后原题】”开头，提取题目并把里面的拼写/语法错误纠正，不要加任何废话和多余的话，只保留纯题目内容。
+第二部分：以“【AI解答】”开头，详细解答我的疑惑。
+"""
     
     try:
-        # 调用千问模型（推荐使用 qwen-plus，性价比高[citation:3]）
-        completion = qwen_client.chat.completions.create(
-            model="qwen-plus",
+        # 调用智谱模型
+        completion = zhipu_client.chat.completions.create(
+            model="glm-4.7",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.8
         )
         ai_reply = completion.choices[0].message.content
+
+         # --- 👇 这里加入切割和追加逻辑 👇 ---
+        fixed_text = question_text
+        answer_text = ai_reply 
+        
+        # 如果 AI 听话，按我们要求的格式输出了，就切开
+        if "【AI解答】" in ai_reply:
+            parts = ai_reply.split("【AI解答】")
+            fixed_text = parts[0].replace("【修复后原题】", "").strip()
+            answer_text = parts[1].strip()
+
+        # 更新回数据库
+        cursor.execute(
+            "UPDATE errors SET doubt = ?, ai_reply = ? WHERE id = ?", 
+            (doubt_req.doubt, answer_text, doubt_req.error_id)
+        )
+        conn.commit()
+        conn.close()
+
+        return {"status": "success", "ai_reply": answer_text, "fixed_text": fixed_text}
+
+        # 👇 更安全的解析逻辑
+        fixed_text = question_text
+        answer_text = ai_reply # 默认展示完整回答
+
+        if "【AI解答】" in ai_reply:
+            parts = ai_reply.split("【AI解答】")
+            fixed_text = parts[0].replace("【修复后原题】", "").strip()
+            answer_text = parts[1].strip()
+        elif "【修复后原题】" in ai_reply:
+            # 只有原题没有解答的极端情况
+            fixed_text = ai_reply.replace("【修复后原题】", "").strip()
+            answer_text = "AI 未给出详细解答。"
+
+        # 存数据库
+        cursor.execute(
+            "UPDATE errors SET text = ?, ai_reply = ? WHERE id = ?", 
+            (fixed_text, answer_text, doubt_req.error_id)
+        )
+        conn.commit()
+        conn.close()
+
+        # 返回给前端（返回 answer_text，前端显示的就是这个）
+        return {"status": "success", "ai_reply": answer_text, "fixed_text": fixed_text}
     except Exception as e:
         conn.close()
-        return {"error": f"千问调用失败: {str(e)}"}
+        return {"error": f"智谱调用失败: {str(e)}"}
         
     cursor.execute("UPDATE errors SET doubt = ?, ai_reply = ? WHERE id = ?", (doubt_req.doubt, ai_reply, doubt_req.error_id))
     conn.commit()
     conn.close()
     
     return {"status": "success", "ai_reply": ai_reply} 
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
+    base_url="https://open.bigmodel.cn/api/paas/v4" 
 
 
-@app.post("/api/qwen-plus")
+@app.post("/api/ask_glm")
 def ask_ai(request: Request, doubt_req: DoubtRequest): 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -676,28 +758,42 @@ def ask_ai(request: Request, doubt_req: DoubtRequest):
     row = cursor.fetchone()
     if not row:
         conn.close()
-        return {"error": "找不到该错题"}
+    return {"error": "找不到该错题"}
     
     question_text = row[0]
     prompt = f"我有一道错题：{question_text}\n我的疑惑是：{doubt_req.doubt}\n请用高中生能听懂的语言，详细解答我的疑惑。"
     
     try:
-        # 调用千问模型（推荐使用 qwen-plus，性价比高[citation:3]）
-        completion = qwen_client.chat.completions.create(
-            model="qwen-plus",
+        # 调用智谱模型
+        completion = zhipu_client.chat.completions.create(
+            model="glm-4.7",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.8
         )
         ai_reply = completion.choices[0].message.content
     except Exception as e:
         conn.close()
-        return {"error": f"千问调用失败: {str(e)}"}
+        return {"error": f"智谱调用失败: {str(e)}"}
         
     cursor.execute("UPDATE errors SET doubt = ?, ai_reply = ? WHERE id = ?", (request.doubt, ai_reply, request.error_id))
     conn.commit()
     conn.close()
-    s
     return {"status": "success", "ai_reply": ai_reply}
+
+class UpdateErrorRequest(BaseModel):
+    text: str
+
+@app.put("/api/errors/{error_id}")
+def update_error(error_id: int, req: UpdateErrorRequest, current_user: str = Depends(get_current_user)):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # 更新题目文本
+    cursor.execute("UPDATE errors SET text = ? WHERE id = ?", (req.text, error_id))
+    conn.commit()
+    conn.close()
+    
+    return {"status": "success", "message": "题目内容已更新"}
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
